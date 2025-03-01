@@ -1,74 +1,256 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"log"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"golang.org/x/exp/mmap"
 )
 
-type Stats struct {
+// StationID is a numeric identifier for a station
+type StationID uint16
+
+// StationStats holds the statistics for a station
+type StationStats struct {
 	Min   float64
 	Max   float64
 	Sum   float64
 	Count int64
 }
 
-func worker(id int, jobs <-chan []byte, results chan<- map[string]*Stats, wg *sync.WaitGroup) {
-	defer wg.Done()
-	// Process each batch of lines
-	for batch := range jobs {
-		statsMap := make(map[string]*Stats, 100) // Pre-allocate with larger capacity
+// StationMap is a custom hash table optimized for station names
+// It uses open addressing with linear probing
+type StationMap struct {
+	keys     []string
+	values   []StationStats
+	occupied []bool
+	size     int
+	capacity int
+	mask     int
+}
 
-		// Split the batch into lines
-		lines := bytes.Split(batch, []byte("\n"))
+// NewStationMap creates a new StationMap with the given capacity
+func NewStationMap(capacity int) *StationMap {
+	// Round up to power of 2 for fast modulo with mask
+	capacity = nextPowerOfTwo(capacity)
+	return &StationMap{
+		keys:     make([]string, capacity),
+		values:   make([]StationStats, capacity),
+		occupied: make([]bool, capacity),
+		size:     0,
+		capacity: capacity,
+		mask:     capacity - 1,
+	}
+}
 
-		for _, line := range lines {
-			if len(line) == 0 {
-				continue // Skip empty lines
-			}
+// nextPowerOfTwo returns the next power of two greater than or equal to v
+func nextPowerOfTwo(v int) int {
+	v--
+	v |= v >> 1
+	v |= v >> 2
+	v |= v >> 4
+	v |= v >> 8
+	v |= v >> 16
+	v++
+	return v
+}
 
-			// Find the separator position
-			sepIdx := bytes.IndexByte(line, ';')
-			if sepIdx < 0 {
-				continue // Skip invalid lines
-			}
+// hash returns a hash of the string s
+func hash(s string) uint32 {
+	h := uint32(2166136261)
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return h
+}
 
-			// Extract station name and measurement
-			station := string(line[:sepIdx])
-			measurement, err := strconv.ParseFloat(string(line[sepIdx+1:]), 64)
-			if err != nil {
-				continue
-			}
+// Get returns the stats for the given station
+func (m *StationMap) Get(station string) (*StationStats, bool) {
+	h := hash(station) & uint32(m.mask)
+	for {
+		if !m.occupied[h] {
+			return nil, false
+		}
+		if m.keys[h] == station {
+			return &m.values[h], true
+		}
+		h = (h + 1) & uint32(m.mask)
+	}
+}
 
-			stat, exists := statsMap[station]
-			if !exists {
-				statsMap[station] = &Stats{
-					Min:   measurement,
-					Max:   measurement,
-					Sum:   measurement,
-					Count: 1,
-				}
-			} else {
-				if measurement < stat.Min {
-					stat.Min = measurement
-				}
-				if measurement > stat.Max {
-					stat.Max = measurement
-				}
-				stat.Sum += measurement
-				stat.Count++
+// Put adds or updates the stats for the given station
+func (m *StationMap) Put(station string, stats StationStats) {
+	// Grow if load factor exceeds 0.7
+	if float64(m.size+1)/float64(m.capacity) > 0.7 {
+		m.grow()
+	}
+
+	h := hash(station) & uint32(m.mask)
+	for {
+		if !m.occupied[h] {
+			m.keys[h] = station
+			m.values[h] = stats
+			m.occupied[h] = true
+			m.size++
+			return
+		}
+		if m.keys[h] == station {
+			m.values[h] = stats
+			return
+		}
+		h = (h + 1) & uint32(m.mask)
+	}
+}
+
+// grow increases the capacity of the map
+func (m *StationMap) grow() {
+	newCapacity := m.capacity * 2
+	newMap := NewStationMap(newCapacity)
+
+	for i := 0; i < m.capacity; i++ {
+		if m.occupied[i] {
+			newMap.Put(m.keys[i], m.values[i])
+		}
+	}
+
+	m.keys = newMap.keys
+	m.values = newMap.values
+	m.occupied = newMap.occupied
+	m.size = newMap.size
+	m.capacity = newMap.capacity
+	m.mask = newMap.mask
+}
+
+// Range calls f for each station in the map
+func (m *StationMap) Range(f func(station string, stats *StationStats) bool) {
+	for i := 0; i < m.capacity; i++ {
+		if m.occupied[i] {
+			if !f(m.keys[i], &m.values[i]) {
+				return
 			}
 		}
-		// Send results
-		results <- statsMap
 	}
+}
+
+// ByteSlice is a slice of bytes
+type ByteSlice []byte
+
+// ParseFloat parses a float from a byte slice without allocations
+func ParseFloat(b ByteSlice) (float64, error) {
+	// Fast path for common case
+	if len(b) == 0 {
+		return 0, fmt.Errorf("empty string")
+	}
+
+	// Handle negative numbers
+	neg := false
+	if b[0] == '-' {
+		neg = true
+		b = b[1:]
+	}
+
+	// Parse integer part
+	var val float64
+	var i int
+	for i = 0; i < len(b) && b[i] >= '0' && b[i] <= '9'; i++ {
+		val = val*10 + float64(b[i]-'0')
+	}
+
+	// Parse decimal part
+	if i < len(b) && b[i] == '.' {
+		pow10 := 1.0
+		for j := i + 1; j < len(b); j++ {
+			if b[j] < '0' || b[j] > '9' {
+				return 0, fmt.Errorf("invalid character in decimal part")
+			}
+			pow10 *= 10.0
+			val += float64(b[j]-'0') / pow10
+		}
+	} else if i < len(b) {
+		return 0, fmt.Errorf("invalid character in number")
+	}
+
+	if neg {
+		val = -val
+	}
+	return val, nil
+}
+
+// UnsafeString converts a byte slice to a string without allocation
+func UnsafeString(b []byte) string {
+	return *(*string)(unsafe.Pointer(&b))
+}
+
+// LineProcessor processes a batch of lines
+func LineProcessor(batch []byte, result *StationMap) {
+	// Split the batch into lines
+	var start int
+	for i := 0; i < len(batch); i++ {
+		if batch[i] == '\n' {
+			line := batch[start:i]
+			if len(line) > 0 {
+				// Find the separator position
+				sepIdx := -1
+				for j := 0; j < len(line); j++ {
+					if line[j] == ';' {
+						sepIdx = j
+						break
+					}
+				}
+
+				if sepIdx >= 0 {
+					// Extract station name and measurement
+					station := UnsafeString(line[:sepIdx])
+					measurement, err := ParseFloat(line[sepIdx+1:])
+					if err == nil {
+						// Update stats
+						stats, exists := result.Get(station)
+						if !exists {
+							result.Put(station, StationStats{
+								Min:   measurement,
+								Max:   measurement,
+								Sum:   measurement,
+								Count: 1,
+							})
+						} else {
+							if measurement < stats.Min {
+								stats.Min = measurement
+							}
+							if measurement > stats.Max {
+								stats.Max = measurement
+							}
+							stats.Sum += measurement
+							stats.Count++
+						}
+					}
+				}
+			}
+			start = i + 1
+		}
+	}
+}
+
+// Worker processes batches of data
+func Worker(id int, jobs <-chan []byte, results chan<- *StationMap, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	// Pre-allocate a result map for this worker
+	result := NewStationMap(200) // Expect around 200 stations
+
+	// Process each batch
+	for batch := range jobs {
+		LineProcessor(batch, result)
+	}
+
+	// Send the result
+	results <- result
 }
 
 // min returns the smaller of two int64 values
@@ -118,9 +300,9 @@ func processFile(filename string) error {
 
 	// Dynamically adjust batch size based on file size
 	// For very large files, use larger batches
-	batchSize := int64(4 * 1024 * 1024) // Default: 4MB per batch
-	if fileSize > 1024*1024*1024 {      // If file is larger than 1GB
-		batchSize = 8 * 1024 * 1024 // Use 8MB per batch
+	batchSize := int64(8 * 1024 * 1024) // Default: 8MB per batch
+	if fileSize > 5*1024*1024*1024 {    // If file is larger than 5GB
+		batchSize = 16 * 1024 * 1024 // Use 16MB per batch
 	}
 
 	// Calculate number of batches
@@ -129,12 +311,12 @@ func processFile(filename string) error {
 		numBatches, batchSize/(1024*1024))
 
 	// Create channels with sufficient buffer to avoid deadlocks
-	jobBuffer := numCPU * 4 // Buffer size for job channel
+	jobBuffer := numCPU * 2 // Buffer size for job channel
 	jobs := make(chan []byte, jobBuffer)
 
-	// Create a separate channel for results with a large buffer
-	resultBuffer := numCPU * 8 // Buffer size for result channel
-	results := make(chan map[string]*Stats, resultBuffer)
+	// Create a separate channel for results with a buffer
+	resultBuffer := numCPU // Buffer size for result channel
+	results := make(chan *StationMap, resultBuffer)
 
 	// Start worker timing
 	startWorkers := time.Now()
@@ -145,7 +327,7 @@ func processFile(filename string) error {
 	// Start workers
 	for i := 0; i < numCPU; i++ {
 		workerWg.Add(1)
-		go worker(i, jobs, results, &workerWg)
+		go Worker(i, jobs, results, &workerWg)
 	}
 
 	// Create a goroutine to close the results channel when all workers are done
@@ -162,6 +344,9 @@ func processFile(filename string) error {
 	// Create a goroutine to read the file and send batches to workers
 	var fileReadWg sync.WaitGroup
 	fileReadWg.Add(1)
+
+	// Track progress
+	var bytesProcessed int64
 
 	go func() {
 		defer fileReadWg.Done()
@@ -188,6 +373,9 @@ func processFile(filename string) error {
 			jobs <- batch
 			batchCount++
 
+			// Update progress
+			atomic.AddInt64(&bytesProcessed, size)
+
 		}
 
 		fmt.Printf("Reading complete: %d batches in %v\n",
@@ -197,50 +385,27 @@ func processFile(filename string) error {
 	// Start aggregation timing
 	startAggregation := time.Now()
 
-	// Use sync.Map for lock-free concurrent access
-	var finalStats sync.Map
+	// Create a final map to store the results
+	finalMap := NewStationMap(200) // Expect around 200 stations
 	resultCount := 0
 
 	// Process results as they come in
-	for partialStats := range results {
+	for workerMap := range results {
 		resultCount++
 
-		// Process each station in the partial results
-		for station, stat := range partialStats {
-			// Try to load existing stats or store new ones atomically
-			existingVal, loaded := finalStats.LoadOrStore(station, &Stats{
-				Min:   stat.Min,
-				Max:   stat.Max,
-				Sum:   stat.Sum,
-				Count: stat.Count,
-			})
-
-			// If we found existing stats, update them atomically
-			if loaded {
-				existingStat := existingVal.(*Stats)
-
-				// Use atomic operations for updating the stats
-				// This is a critical section, but sync.Map helps reduce contention
-				func() {
-					// Create a very small critical section with a mutex
-					// This is much more efficient than locking the entire map
-					mu := &sync.Mutex{}
-					mu.Lock()
-					defer mu.Unlock()
-
-					// Update the stats
-					if stat.Min < existingStat.Min {
-						existingStat.Min = stat.Min
-					}
-					if stat.Max > existingStat.Max {
-						existingStat.Max = stat.Max
-					}
-					existingStat.Sum += stat.Sum
-					existingStat.Count += stat.Count
-				}()
+		// Merge the worker's map into the final map
+		workerMap.Range(func(station string, stats *StationStats) bool {
+			finalStats, exists := finalMap.Get(station)
+			if !exists {
+				finalMap.Put(station, *stats)
+			} else {
+				finalStats.Min = minFloat(finalStats.Min, stats.Min)
+				finalStats.Max = maxFloat(finalStats.Max, stats.Max)
+				finalStats.Sum += stats.Sum
+				finalStats.Count += stats.Count
 			}
-		}
-
+			return true
+		})
 	}
 
 	// Wait for file reading to complete (should already be done)
@@ -256,18 +421,16 @@ func processFile(filename string) error {
 	sb.WriteString("{")
 	first := true
 
-	// Convert sync.Map to regular map for output formatting
+	// Convert map to output format
 	stationCount := 0
-	finalStats.Range(func(key, value interface{}) bool {
-		station := key.(string)
-		stat := value.(*Stats)
+	finalMap.Range(func(station string, stats *StationStats) bool {
 		stationCount++
 
 		if !first {
 			sb.WriteString(", ")
 		}
-		mean := stat.Sum / float64(stat.Count)
-		sb.WriteString(fmt.Sprintf("%s=%.1f/%.1f/%.1f", station, stat.Min, mean, stat.Max))
+		mean := stats.Sum / float64(stats.Count)
+		sb.WriteString(fmt.Sprintf("%s=%.1f/%.1f/%.1f", station, stats.Min, mean, stats.Max))
 		first = false
 		return true
 	})
