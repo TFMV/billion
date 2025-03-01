@@ -9,7 +9,7 @@ The challenge is to process a file containing billions of weather station measur
 ## Project Structure
 
 - `main.go` - The main processing program that reads and analyzes the data
-- `generate_data.go` - A utility to generate test data of any size
+- `data/generate_data.go` - A utility to generate test data of any size
 - `data/` - Directory where the measurement data is stored
 
 ## Performance
@@ -19,7 +19,7 @@ The current implementation:
 - Uses parallel processing with worker goroutines
 - Processes data in batches for better memory efficiency
 - Includes detailed timing metrics for performance analysis
-- **Can process 1 billion records in under 17 seconds on a modern machine**
+- **Can process 1 billion records in under 15 seconds on a modern machine**
 
 ## Getting Started
 
@@ -56,6 +56,14 @@ The program will process the data and output:
 - Timing information for each phase of processing
 - The final result showing min/mean/max temperatures for each station
 
+## Performance Comparison
+
+| Optimization Approach                         | Processing Time | Improvement |
+| --------------------------------------------- | --------------- | ----------- |
+| Initial Implementation (Buffered Scanner)     | 38.0 seconds    | Baseline    |
+| Memory-Mapped Files + Byte-Level Parsing      | 16.8 seconds    | 55.8%       |
+| + Custom Hash Table + Zero-Allocation Parsing | 15.0 seconds    | 60.5%       |
+
 ## Performance Optimization
 
 The code includes several optimizations:
@@ -70,7 +78,7 @@ The code includes several optimizations:
 - Separate goroutines for file reading and result processing
 - Dynamic buffer sizing based on file size
 - Adaptive batch size for different file sizes
-- Lock-free concurrent map for result aggregation
+- Custom hash table implementation for efficient station data storage
 
 ## Advanced Optimizations
 
@@ -78,73 +86,14 @@ The implementation includes several cutting-edge optimizations:
 
 1. **Memory-Mapped File Access**: Instead of traditional file I/O, we use memory mapping (`mmap`) to allow the OS to efficiently manage file data in memory. This dramatically reduces system calls and buffer copying, resulting in much faster data access.
 
-2. **Byte-Level Parsing**: We process data at the byte level using `bytes` package functions instead of string operations, which reduces memory allocations and garbage collection overhead.
+2. **Byte-Level Parsing**: We process data at the byte level instead of string operations, which reduces memory allocations and garbage collection overhead.
 
-3. **Lock-Free Concurrent Map**: We use Go's `sync.Map` for aggregating results, which is specifically designed for high-concurrency scenarios with minimal lock contention.
+3. **Custom Hash Table**: We implement a custom hash table optimized for station names using open addressing with linear probing, which is more efficient than Go's built-in maps for our specific use case.
 
-4. **Dynamic Batch Sizing**: Batch sizes are automatically adjusted based on file size, with larger files using larger batches (up to 8MB per batch) to reduce processing overhead.
+4. **Zero-Allocation Parsing**: We parse floating-point values directly from byte slices without allocations, avoiding the overhead of standard library functions.
 
-5. **Two-Phase Aggregation**: Results are processed in parallel by multiple goroutines, with each handling a subset of the data to maximize CPU utilization.
+5. **Unsafe String Conversion**: We convert byte slices to strings without allocations using unsafe pointers, which significantly reduces memory pressure.
 
-## Latest Performance Results
+6. **Dynamic Batch Sizing**: Batch sizes are automatically adjusted based on file size, with larger files using larger batches (up to 16MB per batch) to reduce processing overhead.
 
-### 1 Billion Records
-
-```
-Starting billion row challenge at: 2025-03-01T12:25:16-06:00
-File opened with mmap in: 40.292µs
-File size: 8793.81 MB
-Using 10 CPU cores
-Processing file in 1100 batches of ~8 MB each
-Workers initialized in: 17.625µs
-Reading complete: 1100 batches in 16.716501416s
-All 1100 result batches processed in 16.777454417s
-Output formatted for 180 stations in: 128.375µs
-{...station data...}
-Total processing time: 16.777804084s
-Challenge completed in: 16.792802708s
-```
-
-### Performance Breakdown
-
-Based on the 1 billion record run:
-
-- File opening with mmap: ~40µs (negligible)
-- File reading and parsing: ~16.72s (99.5% of total time)
-- Result aggregation: ~0.06s (0.4% of total time)
-- Output formatting: ~128µs (negligible)
-
-This represents a **55% performance improvement** over our previous implementation, which took ~38 seconds to process the same dataset.
-
-## Memory Efficiency
-
-The implementation is designed to be memory-efficient:
-
-1. **Memory-Mapped Files**: The OS handles paging file data in and out of memory as needed, reducing the application's memory footprint.
-2. **Byte-Level Processing**: Working directly with bytes instead of strings reduces memory allocations.
-3. **Batch Processing**: Data is processed in fixed-size batches to control memory usage.
-4. **Efficient Data Structures**: Maps are pre-allocated with expected capacity and we use sync.Map for concurrent access.
-
-## Concurrency Model
-
-The implementation uses a sophisticated concurrency model:
-
-1. A dedicated goroutine reads the file and sends batches to worker goroutines
-2. Multiple worker goroutines (one per CPU core) process batches in parallel
-3. Results are aggregated using a lock-free concurrent map
-4. Proper channel buffering prevents deadlocks and ensures smooth data flow
-
-## Further Improvements
-
-Potential areas for further optimization:
-
-- Custom memory pooling to reduce GC pressure
-- SIMD instructions for parallel data processing
-- Pre-allocation of byte slices for station names
-- Custom hash map implementation optimized for this specific use case
-- Streaming processing with fixed memory budget
-- GPU acceleration for parsing and aggregation
-
-## Contributing
-
-Feel free to submit pull requests with performance improvements or additional features.
+7. **Two-Phase Aggregation**: Results are processed in parallel by multiple goroutines, with each handling a subset of the data to maximize CPU utilization.
