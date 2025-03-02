@@ -27,3 +27,6 @@ go.work.sum
 .DS_Store
 
 data/measurements.txt
+
+data/data/measurements.txt
+data/billion.md
