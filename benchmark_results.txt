@@ -1,0 +1,36 @@
+=== BENCHMARK RESULTS ===
+Date: Mon, 10 Mar 2025 04:52:56 CDT
+CPU: 10 cores
+OS: darwin
+
+Version: V1
+  Average Time: 15.577186316s
+  Median Time:  15.452524792s
+  Min Time:     15.312534916s
+  Max Time:     16.010921166s
+  Memory Used:  0.02 MB
+  Throughput:   64.20 million rows/second
+
+Version: V2
+  Average Time: 3.757074466s
+  Median Time:  3.696428625s
+  Min Time:     3.58960625s
+  Max Time:     4.058022875s
+  Memory Used:  0.03 MB
+  Throughput:   266.16 million rows/second
+
+Version: V3
+  Average Time: 115.239991ms
+  Median Time:  80.830541ms
+  Min Time:     67.155125ms
+  Max Time:     261.212125ms
+  Memory Used:  0.01 MB
+  Throughput:   8677.54 million rows/second
+
+
+Fastest implementation: V3 (8677.54 million rows/second)
+
+Speedup Comparisons:
+  V1 → V2: 4.15x
+  V1 → V3: 135.17x
+  V2 → V3: 32.60x
