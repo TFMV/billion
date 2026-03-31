@@ -166,7 +166,7 @@ func splitFile(inputPath string, numParts int) ([]part, error) {
 
 func main() {
 	start := time.Now()
-	r8("data/temperature-readings.csv", os.Stdout)
+	r8("/Users/tfmv/billion/billion/data/data/measurements.txt", os.Stdout)
 	// Print benchmark summary
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
